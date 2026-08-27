@@ -3660,6 +3660,109 @@ builder.add_edge(
 )
 
 sql_app = builder.compile()
+
+
+# ============================================================
+# EXTRACT CANDIDATE NAME FROM USER QUESTION
+# ============================================================
+
+def extract_candidate_name(
+    question: str
+):
+
+    prompt = f"""
+You are an HR Recruitment Question Analyzer.
+
+Your task is to determine whether the user is asking
+about one specific candidate.
+
+USER QUESTION:
+
+{question}
+
+RULES:
+
+1. Extract the candidate name if a specific candidate
+   is mentioned.
+
+2. Preserve the candidate name exactly as the user typed it.
+
+3. Do not correct spelling.
+
+4. Do not invent a candidate name.
+
+5. If no specific candidate is mentioned, return null.
+
+Examples:
+
+Question:
+"can u give me the skills of the Mamdou Salem?"
+
+Return:
+
+{{
+    "candidate_name": "Mamdou Salem"
+}}
+
+Question:
+"what is the email of Jithu Daniel?"
+
+Return:
+
+{{
+    "candidate_name": "Jithu Daniel"
+}}
+
+Question:
+"show me all candidates in requisition 44"
+
+Return:
+
+{{
+    "candidate_name": null
+}}
+
+Return ONLY valid JSON.
+"""
+
+    response = llm_intent.invoke(
+        prompt
+    )
+
+    content = (
+        response.content
+        .strip()
+    )
+
+    # Remove markdown JSON fences if present
+    if content.startswith("```"):
+
+        content = content.replace(
+            "```json",
+            ""
+        )
+
+        content = content.replace(
+            "```",
+            ""
+        )
+
+        content = content.strip()
+
+    try:
+
+        result = json.loads(
+            content
+        )
+
+    except json.JSONDecodeError:
+
+        return None
+
+    return result.get(
+        "candidate_name"
+    )
+
 # ============================================================
 # 7. Execute HR Q&A
 # ============================================================
