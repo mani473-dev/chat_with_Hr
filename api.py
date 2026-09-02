@@ -25,17 +25,15 @@ app = FastAPI(
 # CONVERSATION MEMORY
 # ============================================================
 
-# Key:
-#     Oracle conversationId
+# Stores application-level conversation state.
 #
-# Value:
-#     Application-specific state
+# The key is the Oracle conversationId.
 #
 # Example:
 #
 # CONVERSATIONS["ABC123"] = {
 #     "original_question":
-#         "Can you give me the skills of Mamdou Salem?",
+#         "Give me the skills of Mamdou Salem",
 #
 #     "requested_candidate":
 #         "Mamdou Salem",
@@ -51,20 +49,29 @@ CONVERSATIONS = {}
 
 
 # ============================================================
+# CURRENT ORACLE CONVERSATION ID
+# ============================================================
+
+# The External REST Tool does NOT need to send conversationId
+# to this FastAPI endpoint.
+#
+# The first Oracle call starts with None.
+#
+# Oracle then returns a conversationId.
+#
+# That same conversationId is reused for subsequent
+# requests until the conversation is ended/reset.
+
+ORACLE_CONVERSATION_ID = None
+
+
+# ============================================================
 # REQUEST MODEL
 # ============================================================
 
 class QuestionRequest(BaseModel):
 
     question: str
-
-    # First request:
-    #     null / ""
-    #
-    # Following requests:
-    #     Oracle conversationId
-
-    conversationId: str | None = None
 
 
 # ============================================================
@@ -81,29 +88,7 @@ def home():
 
 # ============================================================
 # HELPER:
-# NORMALIZE CONVERSATION ID
-# ============================================================
-
-def normalize_conversation_id(
-    conversation_id: str | None
-):
-
-    if conversation_id is None:
-        return None
-
-    conversation_id = (
-        conversation_id.strip()
-    )
-
-    if not conversation_id:
-        return None
-
-    return conversation_id
-
-
-# ============================================================
-# HELPER:
-# EXTRACT CONVERSATION ID FROM RESPONSE
+# EXTRACT ORACLE CONVERSATION ID
 # ============================================================
 
 def extract_conversation_id(
@@ -114,6 +99,7 @@ def extract_conversation_id(
         response,
         dict
     ):
+
         return None
 
     return (
@@ -185,12 +171,39 @@ def build_corrected_question(
         and
         new_candidate
     ):
+
         return original_question
 
     return original_question.replace(
         old_candidate,
         new_candidate
     )
+
+
+# ============================================================
+# HELPER:
+# UPDATE ORACLE CONVERSATION ID
+# ============================================================
+
+def update_oracle_conversation_id(
+    response
+):
+
+    global ORACLE_CONVERSATION_ID
+
+    returned_conversation_id = (
+        extract_conversation_id(
+            response
+        )
+    )
+
+    if returned_conversation_id:
+
+        ORACLE_CONVERSATION_ID = (
+            returned_conversation_id
+        )
+
+    return ORACLE_CONVERSATION_ID
 
 
 # ============================================================
@@ -201,6 +214,8 @@ def build_corrected_question(
 def execute(
     request: QuestionRequest
 ):
+
+    global ORACLE_CONVERSATION_ID
 
     try:
 
@@ -221,13 +236,11 @@ def execute(
 
 
         # ====================================================
-        # 2. GET ORACLE CONVERSATION ID
+        # 2. CURRENT ORACLE CONVERSATION
         # ====================================================
 
         conversation_id = (
-            normalize_conversation_id(
-                request.conversationId
-            )
+            ORACLE_CONVERSATION_ID
         )
 
 
@@ -248,7 +261,7 @@ def execute(
         )
 
         print(
-            "\nINCOMING CONVERSATION ID:"
+            "\nORACLE CONVERSATION ID:"
         )
 
         print(
@@ -304,7 +317,7 @@ def execute(
 
 
             # =================================================
-            # 4A. LET LLM UNDERSTAND USER MESSAGE
+            # LET LLM UNDERSTAND USER RESPONSE
             # =================================================
 
             decision = (
@@ -351,7 +364,7 @@ def execute(
 
 
             # =================================================
-            # 4B. CONFIRM
+            # 4A. CONFIRM
             # =================================================
 
             if intent == "CONFIRM":
@@ -388,10 +401,6 @@ def execute(
                 )
 
 
-                # ---------------------------------------------
-                # SAFETY CHECK
-                # ---------------------------------------------
-
                 if not (
                     original_question
                     and
@@ -421,10 +430,6 @@ def execute(
                     }
 
 
-                # ---------------------------------------------
-                # REPLACE WRONG NAME
-                # ---------------------------------------------
-
                 corrected_question = (
                     build_corrected_question(
                         original_question,
@@ -452,7 +457,7 @@ def execute(
 
 
                 # ---------------------------------------------
-                # REMOVE PENDING CANDIDATE STATE
+                # REMOVE ONLY PENDING CANDIDATE STATE
                 # ---------------------------------------------
 
                 CONVERSATIONS.pop(
@@ -462,8 +467,7 @@ def execute(
 
 
                 # ---------------------------------------------
-                # RUN HR QUERY USING SAME
-                # ORACLE CONVERSATION ID
+                # CONTINUE SAME ORACLE CONVERSATION
                 # ---------------------------------------------
 
                 response = getOutput(
@@ -472,18 +476,15 @@ def execute(
                 )
 
 
-                returned_conversation_id = (
-                    extract_conversation_id(
+                # ---------------------------------------------
+                # KEEP ORACLE CONVERSATION ID
+                # ---------------------------------------------
+
+                conversation_id = (
+                    update_oracle_conversation_id(
                         response
                     )
                 )
-
-
-                if returned_conversation_id:
-
-                    conversation_id = (
-                        returned_conversation_id
-                    )
 
 
                 return {
@@ -514,7 +515,7 @@ def execute(
 
 
             # =================================================
-            # 4C. REJECT
+            # 4B. REJECT
             # =================================================
 
             elif intent == "REJECT":
@@ -532,9 +533,7 @@ def execute(
                 )
 
 
-                # Keep the same conversation state.
-                #
-                # The user's next message can provide
+                # Keep the state so the user can provide
                 # another candidate.
 
                 previous_state[
@@ -564,7 +563,7 @@ def execute(
 
 
             # =================================================
-            # 4D. CHANGE
+            # 4C. CHANGE
             # =================================================
 
             elif intent == "CHANGE":
@@ -667,8 +666,7 @@ def execute(
 
 
                 # ---------------------------------------------
-                # RUN HR QUERY USING SAME
-                # CONVERSATION ID
+                # CONTINUE SAME ORACLE CONVERSATION
                 # ---------------------------------------------
 
                 response = getOutput(
@@ -677,18 +675,11 @@ def execute(
                 )
 
 
-                returned_conversation_id = (
-                    extract_conversation_id(
+                conversation_id = (
+                    update_oracle_conversation_id(
                         response
                     )
                 )
-
-
-                if returned_conversation_id:
-
-                    conversation_id = (
-                        returned_conversation_id
-                    )
 
 
                 return {
@@ -719,7 +710,7 @@ def execute(
 
 
             # =================================================
-            # 4E. CONTINUE
+            # 4D. CONTINUE
             # =================================================
 
             elif intent == "CONTINUE":
@@ -737,10 +728,8 @@ def execute(
                 )
 
 
-                # The user is continuing the conversation.
-                #
-                # Send the new question using the SAME
-                # Oracle conversationId.
+                # Send the current question using the
+                # SAME Oracle conversationId.
 
                 response = getOutput(
                     question,
@@ -748,23 +737,15 @@ def execute(
                 )
 
 
-                returned_conversation_id = (
-                    extract_conversation_id(
+                conversation_id = (
+                    update_oracle_conversation_id(
                         response
                     )
                 )
 
 
-                if returned_conversation_id:
-
-                    conversation_id = (
-                        returned_conversation_id
-                    )
-
-
                 # ---------------------------------------------
-                # Check whether this response produced
-                # another candidate suggestion.
+                # Check for another candidate suggestion
                 # ---------------------------------------------
 
                 if isinstance(
@@ -817,7 +798,7 @@ def execute(
 
 
             # =================================================
-            # 4F. OTHER
+            # 4E. OTHER
             # =================================================
 
             else:
@@ -835,8 +816,7 @@ def execute(
                 )
 
 
-                # For an unclear natural-language response,
-                # continue the same Oracle conversation.
+                # Keep using the same Oracle conversation.
 
                 response = getOutput(
                     question,
@@ -844,18 +824,11 @@ def execute(
                 )
 
 
-                returned_conversation_id = (
-                    extract_conversation_id(
+                conversation_id = (
+                    update_oracle_conversation_id(
                         response
                     )
                 )
-
-
-                if returned_conversation_id:
-
-                    conversation_id = (
-                        returned_conversation_id
-                    )
 
 
                 return {
@@ -883,7 +856,7 @@ def execute(
 
 
         # ====================================================
-        # 5. FIRST REQUEST / NEW CONVERSATION
+        # 5. FIRST REQUEST
         # ====================================================
 
         print(
@@ -891,7 +864,7 @@ def execute(
         )
 
         print(
-            "NEW CONVERSATION"
+            "FIRST REQUEST / NEW CONVERSATION"
         )
 
         print(
@@ -899,43 +872,34 @@ def execute(
         )
 
 
-        # conversation_id is None here for the first request.
+        # Since this is the first request,
+        # conversation_id is None.
         #
-        # We pass None to getOutput().
+        # getOutput() receives None.
         #
-        # The Oracle invocation should send:
+        # The Oracle invocation layer should send:
         #
-        # {
-        #     "question": "...",
-        #     "conversationId": null
-        # }
+        # "conversationId": null
 
         response = getOutput(
             question,
-            conversation_id
+            None
         )
 
 
         # ====================================================
-        # 6. GET CONVERSATION ID GENERATED BY ORACLE
+        # 6. ORACLE RETURNS CONVERSATION ID
         # ====================================================
 
-        returned_conversation_id = (
-            extract_conversation_id(
+        conversation_id = (
+            update_oracle_conversation_id(
                 response
             )
         )
 
 
-        if returned_conversation_id:
-
-            conversation_id = (
-                returned_conversation_id
-            )
-
-
         print(
-            "\nORACLE CONVERSATION ID:"
+            "\nNEW ORACLE CONVERSATION ID:"
         )
 
         print(
@@ -966,8 +930,8 @@ def execute(
             ):
 
                 # ---------------------------------------------
-                # We need an Oracle conversation ID in order
-                # to store application state.
+                # Oracle must return conversationId so that
+                # application state can be stored.
                 # ---------------------------------------------
 
                 if not conversation_id:
@@ -1011,15 +975,6 @@ def execute(
                         conversation_id
                     ]
                 )
-
-
-                return {
-
-                    **response,
-
-                    "conversationId":
-                        conversation_id
-                }
 
 
         # ====================================================
@@ -1085,4 +1040,3 @@ def execute(
             status_code=500,
             detail=str(e)
         )
-
