@@ -1,3 +1,4 @@
+
 # ============================================================
 # api.py
 # ============================================================
@@ -5,7 +6,10 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from handler import getOutput
+from handler import (
+    getOutput,
+    understand_conversation_response
+)
 
 
 # ============================================================
@@ -20,42 +24,30 @@ app = FastAPI(
 # ============================================================
 # CONVERSATION MEMORY
 # ============================================================
+
+# Key:
+#     Oracle conversationId
 #
-# POC:
-# Store the pending candidate suggestion in memory.
+# Value:
+#     Application-specific state
 #
 # Example:
 #
-# CONVERSATIONS["default"] = {
+# CONVERSATIONS["ABC123"] = {
 #     "original_question":
-#         "can u give me the skills of the Mamdou Salem?",
+#         "Can you give me the skills of Mamdou Salem?",
 #
 #     "requested_candidate":
 #         "Mamdou Salem",
 #
 #     "suggested_candidate":
-#         "Mamdouh Salem"
+#         "Mamdouh Salem",
+#
+#     "awaiting_candidate":
+#         True
 # }
-#
-# IMPORTANT:
-# This memory is cleared when the FastAPI server restarts.
-#
-# ============================================================
 
 CONVERSATIONS = {}
-
-
-# ============================================================
-# INTERNAL CONVERSATION ID
-# ============================================================
-#
-# User does NOT need to send this in Postman.
-#
-# For the POC we use one conversation.
-#
-# ============================================================
-
-CONVERSATION_ID = "default"
 
 
 # ============================================================
@@ -66,6 +58,14 @@ class QuestionRequest(BaseModel):
 
     question: str
 
+    # First request:
+    #     null / ""
+    #
+    # Following requests:
+    #     Oracle conversationId
+
+    conversationId: str | None = None
+
 
 # ============================================================
 # ROOT
@@ -75,9 +75,122 @@ class QuestionRequest(BaseModel):
 def home():
 
     return {
-        "message":
-            "HR Recruitment Q&A API is running"
+        "message": "HR Recruitment Q&A API is running"
     }
+
+
+# ============================================================
+# HELPER:
+# NORMALIZE CONVERSATION ID
+# ============================================================
+
+def normalize_conversation_id(
+    conversation_id: str | None
+):
+
+    if conversation_id is None:
+        return None
+
+    conversation_id = (
+        conversation_id.strip()
+    )
+
+    if not conversation_id:
+        return None
+
+    return conversation_id
+
+
+# ============================================================
+# HELPER:
+# EXTRACT CONVERSATION ID FROM RESPONSE
+# ============================================================
+
+def extract_conversation_id(
+    response
+):
+
+    if not isinstance(
+        response,
+        dict
+    ):
+        return None
+
+    return (
+        response.get(
+            "conversationId"
+        )
+        or
+        response.get(
+            "conversation_id"
+        )
+    )
+
+
+# ============================================================
+# HELPER:
+# SAVE CANDIDATE STATE
+# ============================================================
+
+def save_candidate_state(
+    conversation_id: str,
+    response: dict,
+    original_question: str
+):
+
+    if not conversation_id:
+        return
+
+    CONVERSATIONS[
+        conversation_id
+    ] = {
+
+        "original_question":
+            response.get(
+                "original_question"
+            )
+            or
+            original_question,
+
+        "requested_candidate":
+            response.get(
+                "requested_candidate"
+            ),
+
+        "suggested_candidate":
+            response.get(
+                "suggested_candidate"
+            ),
+
+        "awaiting_candidate":
+            True
+    }
+
+
+# ============================================================
+# HELPER:
+# BUILD CORRECTED QUESTION
+# ============================================================
+
+def build_corrected_question(
+    original_question: str,
+    old_candidate: str,
+    new_candidate: str
+):
+
+    if not (
+        original_question
+        and
+        old_candidate
+        and
+        new_candidate
+    ):
+        return original_question
+
+    return original_question.replace(
+        old_candidate,
+        new_candidate
+    )
 
 
 # ============================================================
@@ -106,19 +219,17 @@ def execute(
                 detail="Question cannot be empty."
             )
 
+
         # ====================================================
-        # 2. GET CONVERSATION MEMORY
+        # 2. GET ORACLE CONVERSATION ID
         # ====================================================
 
         conversation_id = (
-            CONVERSATION_ID
-        )
-
-        previous_state = (
-            CONVERSATIONS.get(
-                conversation_id
+            normalize_conversation_id(
+                request.conversationId
             )
         )
+
 
         print(
             "\n========================================"
@@ -137,54 +248,126 @@ def execute(
         )
 
         print(
-            "\nCONVERSATION ID:"
+            "\nINCOMING CONVERSATION ID:"
         )
 
         print(
             conversation_id
         )
 
+
+        # ====================================================
+        # 3. GET APPLICATION MEMORY
+        # ====================================================
+
+        previous_state = None
+
+        if conversation_id:
+
+            previous_state = (
+                CONVERSATIONS.get(
+                    conversation_id
+                )
+            )
+
+
         print(
-            "\nPREVIOUS CONVERSATION:"
+            "\nPREVIOUS APPLICATION STATE:"
         )
 
         print(
             previous_state
         )
 
+
         # ====================================================
-        # 3. CHECK WHETHER THIS IS A FOLLOW-UP
+        # 4. EXISTING CONVERSATION
         # ====================================================
 
-        if previous_state:
+        if (
+            conversation_id
+            and
+            previous_state
+        ):
+
+            print(
+                "\n========================================"
+            )
+
+            print(
+                "EXISTING CONVERSATION"
+            )
+
+            print(
+                "========================================"
+            )
+
 
             # =================================================
-            # USER CONFIRMS SUGGESTED CANDIDATE
+            # 4A. LET LLM UNDERSTAND USER MESSAGE
             # =================================================
 
-            if question.lower() in {
+            decision = (
+                understand_conversation_response(
+                    user_message=question,
+                    previous_state=previous_state
+                )
+            )
 
-                "yes",
-                "y",
-                "yeah",
-                "yep",
-                "correct",
-                "yes this candidate",
-                "yes that's correct",
-                "yes thats correct"
-            }:
+
+            print(
+                "\nLLM DECISION:"
+            )
+
+            print(
+                decision
+            )
+
+
+            if not isinstance(
+                decision,
+                dict
+            ):
+
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Conversation understanding "
+                        "returned an invalid response."
+                    )
+                )
+
+
+            intent = (
+                str(
+                    decision.get(
+                        "intent",
+                        "OTHER"
+                    )
+                )
+                .strip()
+                .upper()
+            )
+
+
+            # =================================================
+            # 4B. CONFIRM
+            # =================================================
+
+            if intent == "CONFIRM":
 
                 print(
                     "\n========================================"
                 )
 
                 print(
-                    "USER CONFIRMED CANDIDATE"
+                    "LLM DECISION: CONFIRM"
                 )
 
                 print(
                     "========================================"
                 )
+
 
                 original_question = (
                     previous_state.get(
@@ -204,9 +387,10 @@ def execute(
                     )
                 )
 
-                # =================================================
+
+                # ---------------------------------------------
                 # SAFETY CHECK
-                # =================================================
+                # ---------------------------------------------
 
                 if not (
                     original_question
@@ -222,6 +406,7 @@ def execute(
                     )
 
                     return {
+
                         "status":
                             "ERROR",
 
@@ -229,19 +414,25 @@ def execute(
                             (
                                 "The previous candidate "
                                 "suggestion could not be recovered."
-                            )
+                            ),
+
+                        "conversationId":
+                            conversation_id
                     }
 
-                # =================================================
-                # REPLACE WRONG NAME WITH CANONICAL NAME
-                # =================================================
+
+                # ---------------------------------------------
+                # REPLACE WRONG NAME
+                # ---------------------------------------------
 
                 corrected_question = (
-                    original_question.replace(
+                    build_corrected_question(
+                        original_question,
                         requested_candidate,
                         suggested_candidate
                     )
                 )
+
 
                 print(
                     "\nORIGINAL QUESTION:"
@@ -259,22 +450,41 @@ def execute(
                     corrected_question
                 )
 
-                # =================================================
-                # CLEAR MEMORY BEFORE RE-RUNNING
-                # =================================================
+
+                # ---------------------------------------------
+                # REMOVE PENDING CANDIDATE STATE
+                # ---------------------------------------------
 
                 CONVERSATIONS.pop(
                     conversation_id,
                     None
                 )
 
-                # =================================================
-                # RUN HR Q&A AGAIN
-                # =================================================
+
+                # ---------------------------------------------
+                # RUN HR QUERY USING SAME
+                # ORACLE CONVERSATION ID
+                # ---------------------------------------------
 
                 response = getOutput(
-                    corrected_question
+                    corrected_question,
+                    conversation_id
                 )
+
+
+                returned_conversation_id = (
+                    extract_conversation_id(
+                        response
+                    )
+                )
+
+
+                if returned_conversation_id:
+
+                    conversation_id = (
+                        returned_conversation_id
+                    )
+
 
                 return {
 
@@ -296,46 +506,46 @@ def execute(
                         ),
 
                     "message":
-                        response
+                        response,
+
+                    "conversationId":
+                        conversation_id
                 }
 
+
             # =================================================
-            # USER REJECTS SUGGESTED CANDIDATE
+            # 4C. REJECT
             # =================================================
 
-            if question.lower() in {
-
-                "no",
-                "n",
-                "nope",
-                "not this one",
-                "wrong"
-            }:
+            elif intent == "REJECT":
 
                 print(
                     "\n========================================"
                 )
 
                 print(
-                    "USER REJECTED CANDIDATE"
+                    "LLM DECISION: REJECT"
                 )
 
                 print(
                     "========================================"
                 )
 
-                # ------------------------------------------------
-                # Do NOT delete the whole conversation.
-                # Keep it so the user can provide another name.
-                # ------------------------------------------------
+
+                # Keep the same conversation state.
+                #
+                # The user's next message can provide
+                # another candidate.
 
                 previous_state[
                     "awaiting_candidate"
                 ] = True
 
+
                 CONVERSATIONS[
                     conversation_id
                 ] = previous_state
+
 
                 return {
 
@@ -344,44 +554,68 @@ def execute(
 
                     "message":
                         (
-                            "Okay. Tell me the candidate name "
-                            "you want to use."
+                            "Okay. Please provide the "
+                            "candidate name you want to use."
                         ),
 
-                    "state":
-                        previous_state
+                    "conversationId":
+                        conversation_id
                 }
 
+
             # =================================================
-            # USER PROVIDES A NEW CANDIDATE NAME
-            # =================================================
-            #
-            # Example:
-            #
-            # no
-            #
-            # then:
-            #
-            # Mamdouh Salem
-            #
+            # 4D. CHANGE
             # =================================================
 
-            if previous_state.get(
-                "awaiting_candidate",
-                False
-            ):
+            elif intent == "CHANGE":
 
                 print(
                     "\n========================================"
                 )
 
                 print(
-                    "USER PROVIDED NEW CANDIDATE"
+                    "LLM DECISION: CHANGE"
                 )
 
                 print(
                     "========================================"
                 )
+
+
+                new_candidate = (
+                    decision.get(
+                        "candidate_name"
+                    )
+                )
+
+
+                if not new_candidate:
+
+                    previous_state[
+                        "awaiting_candidate"
+                    ] = True
+
+
+                    CONVERSATIONS[
+                        conversation_id
+                    ] = previous_state
+
+
+                    return {
+
+                        "status":
+                            "WAITING_FOR_USER",
+
+                        "message":
+                            (
+                                "Please provide the candidate "
+                                "name you want to use."
+                            ),
+
+                        "conversationId":
+                            conversation_id
+                    }
+
 
                 original_question = (
                     previous_state.get(
@@ -395,62 +629,261 @@ def execute(
                     )
                 )
 
-                if (
-                    original_question
-                    and
-                    requested_candidate
+
+                corrected_question = (
+                    build_corrected_question(
+                        original_question,
+                        requested_candidate,
+                        new_candidate
+                    )
+                )
+
+
+                print(
+                    "\nNEW CANDIDATE:"
+                )
+
+                print(
+                    new_candidate
+                )
+
+                print(
+                    "\nUPDATED QUESTION:"
+                )
+
+                print(
+                    corrected_question
+                )
+
+
+                # ---------------------------------------------
+                # REMOVE OLD PENDING STATE
+                # ---------------------------------------------
+
+                CONVERSATIONS.pop(
+                    conversation_id,
+                    None
+                )
+
+
+                # ---------------------------------------------
+                # RUN HR QUERY USING SAME
+                # CONVERSATION ID
+                # ---------------------------------------------
+
+                response = getOutput(
+                    corrected_question,
+                    conversation_id
+                )
+
+
+                returned_conversation_id = (
+                    extract_conversation_id(
+                        response
+                    )
+                )
+
+
+                if returned_conversation_id:
+
+                    conversation_id = (
+                        returned_conversation_id
+                    )
+
+
+                return {
+
+                    "question":
+                        corrected_question,
+
+                    "status":
+                        (
+                            response.get(
+                                "status",
+                                "COMPLETED"
+                            )
+                            if isinstance(
+                                response,
+                                dict
+                            )
+                            else
+                            "COMPLETED"
+                        ),
+
+                    "message":
+                        response,
+
+                    "conversationId":
+                        conversation_id
+                }
+
+
+            # =================================================
+            # 4E. CONTINUE
+            # =================================================
+
+            elif intent == "CONTINUE":
+
+                print(
+                    "\n========================================"
+                )
+
+                print(
+                    "LLM DECISION: CONTINUE"
+                )
+
+                print(
+                    "========================================"
+                )
+
+
+                # The user is continuing the conversation.
+                #
+                # Send the new question using the SAME
+                # Oracle conversationId.
+
+                response = getOutput(
+                    question,
+                    conversation_id
+                )
+
+
+                returned_conversation_id = (
+                    extract_conversation_id(
+                        response
+                    )
+                )
+
+
+                if returned_conversation_id:
+
+                    conversation_id = (
+                        returned_conversation_id
+                    )
+
+
+                # ---------------------------------------------
+                # Check whether this response produced
+                # another candidate suggestion.
+                # ---------------------------------------------
+
+                if isinstance(
+                    response,
+                    dict
                 ):
 
-                    corrected_question = (
-                        original_question.replace(
-                            requested_candidate,
-                            question
+                    response_status = (
+                        response.get(
+                            "status"
                         )
                     )
 
-                    # Clear conversation memory
-                    CONVERSATIONS.pop(
-                        conversation_id,
-                        None
-                    )
 
-                    print(
-                        "\nUPDATED QUESTION:"
-                    )
+                    if (
+                        response_status
+                        ==
+                        "WAITING_FOR_USER"
+                    ):
 
-                    print(
-                        corrected_question
-                    )
+                        save_candidate_state(
+                            conversation_id,
+                            response,
+                            question
+                        )
 
-                    response = getOutput(
-                        corrected_question
-                    )
 
-                    return {
+                return {
 
-                        "question":
-                            corrected_question,
-
-                        "status":
-                            (
-                                response.get(
-                                    "status",
-                                    "COMPLETED"
-                                )
-                                if isinstance(
-                                    response,
-                                    dict
-                                )
-                                else
+                    "status":
+                        (
+                            response.get(
+                                "status",
                                 "COMPLETED"
-                            ),
+                            )
+                            if isinstance(
+                                response,
+                                dict
+                            )
+                            else
+                            "COMPLETED"
+                        ),
 
-                        "message":
-                            response
-                    }
+                    "message":
+                        response,
+
+                    "conversationId":
+                        conversation_id
+                }
+
+
+            # =================================================
+            # 4F. OTHER
+            # =================================================
+
+            else:
+
+                print(
+                    "\n========================================"
+                )
+
+                print(
+                    "LLM DECISION: OTHER"
+                )
+
+                print(
+                    "========================================"
+                )
+
+
+                # For an unclear natural-language response,
+                # continue the same Oracle conversation.
+
+                response = getOutput(
+                    question,
+                    conversation_id
+                )
+
+
+                returned_conversation_id = (
+                    extract_conversation_id(
+                        response
+                    )
+                )
+
+
+                if returned_conversation_id:
+
+                    conversation_id = (
+                        returned_conversation_id
+                    )
+
+
+                return {
+
+                    "status":
+                        (
+                            response.get(
+                                "status",
+                                "COMPLETED"
+                            )
+                            if isinstance(
+                                response,
+                                dict
+                            )
+                            else
+                            "COMPLETED"
+                        ),
+
+                    "message":
+                        response,
+
+                    "conversationId":
+                        conversation_id
+                }
+
 
         # ====================================================
-        # 4. NEW HR QUESTION
+        # 5. FIRST REQUEST / NEW CONVERSATION
         # ====================================================
 
         print(
@@ -458,19 +891,60 @@ def execute(
         )
 
         print(
-            "NEW HR QUESTION"
+            "NEW CONVERSATION"
         )
 
         print(
             "========================================"
         )
 
+
+        # conversation_id is None here for the first request.
+        #
+        # We pass None to getOutput().
+        #
+        # The Oracle invocation should send:
+        #
+        # {
+        #     "question": "...",
+        #     "conversationId": null
+        # }
+
         response = getOutput(
-            question
+            question,
+            conversation_id
         )
 
+
         # ====================================================
-        # 5. CHECK WHETHER HANDLER FOUND A SUGGESTION
+        # 6. GET CONVERSATION ID GENERATED BY ORACLE
+        # ====================================================
+
+        returned_conversation_id = (
+            extract_conversation_id(
+                response
+            )
+        )
+
+
+        if returned_conversation_id:
+
+            conversation_id = (
+                returned_conversation_id
+            )
+
+
+        print(
+            "\nORACLE CONVERSATION ID:"
+        )
+
+        print(
+            conversation_id
+        )
+
+
+        # ====================================================
+        # 7. CHECK FOR CANDIDATE SUGGESTION
         # ====================================================
 
         if isinstance(
@@ -484,59 +958,48 @@ def execute(
                 )
             )
 
+
             if (
                 response_status
                 ==
                 "WAITING_FOR_USER"
             ):
 
-                requested_candidate = (
-                    response.get(
-                        "requested_candidate"
-                    )
-                )
+                # ---------------------------------------------
+                # We need an Oracle conversation ID in order
+                # to store application state.
+                # ---------------------------------------------
 
-                suggested_candidate = (
-                    response.get(
-                        "suggested_candidate"
-                    )
-                )
+                if not conversation_id:
 
-                original_question = (
-                    response.get(
-                        "original_question"
-                    )
-                    or
+                    return {
+
+                        "status":
+                            "ERROR",
+
+                        "message":
+                            (
+                                "Oracle did not return a "
+                                "conversationId, so the "
+                                "conversation state cannot "
+                                "be stored safely."
+                            )
+                    }
+
+
+                save_candidate_state(
+                    conversation_id,
+                    response,
                     question
                 )
 
-                # =================================================
-                # SAVE CONVERSATION
-                # =================================================
-
-                CONVERSATIONS[
-                    conversation_id
-                ] = {
-
-                    "original_question":
-                        original_question,
-
-                    "requested_candidate":
-                        requested_candidate,
-
-                    "suggested_candidate":
-                        suggested_candidate,
-
-                    "awaiting_candidate":
-                        False
-                }
 
                 print(
                     "\n========================================"
                 )
 
                 print(
-                    "CONVERSATION SAVED"
+                    "CONVERSATION STATE SAVED"
                 )
 
                 print(
@@ -549,20 +1012,43 @@ def execute(
                     ]
                 )
 
-                return response
+
+                return {
+
+                    **response,
+
+                    "conversationId":
+                        conversation_id
+                }
+
 
         # ====================================================
-        # 6. NORMAL RESPONSE
+        # 8. NORMAL RESPONSE
         # ====================================================
 
         return {
 
             "status":
-                "COMPLETED",
+                (
+                    response.get(
+                        "status",
+                        "COMPLETED"
+                    )
+                    if isinstance(
+                        response,
+                        dict
+                    )
+                    else
+                    "COMPLETED"
+                ),
 
             "message":
-                response
+                response,
+
+            "conversationId":
+                conversation_id
         }
+
 
     # ========================================================
     # HTTP ERROR
@@ -571,6 +1057,7 @@ def execute(
     except HTTPException:
 
         raise
+
 
     # ========================================================
     # GENERAL ERROR
@@ -598,3 +1085,4 @@ def execute(
             status_code=500,
             detail=str(e)
         )
+
